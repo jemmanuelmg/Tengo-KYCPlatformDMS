@@ -68,7 +68,7 @@ public class KYCPlatformService {
         request.setBody(rawBody);
         request.setHeader('ApiKey', kycPlatformSetting.APIKey__c);
         request.setHeader('Content-Type', 'application/json');
-		
+        
         Http http = new Http();
         HttpResponse response = http.send(request);
         if (response.getStatusCode() == 200) {
@@ -87,7 +87,7 @@ public class KYCPlatformService {
         }
         
         KYCPlatformSettings__c kycPlatformSetting = KYCPlatformSettings__c.getInstance(UserInfo.getUserId());
-        String caseDesicion;
+        String caseDecision;
         
         HttpRequest request = new HttpRequest();
         request.setEndpoint(kycPlatformSetting.ApiUrl__c + '/v2/companies/' + caseCommonId);
@@ -104,13 +104,13 @@ public class KYCPlatformService {
             Map<String, Object> details = (Map<String, Object>)caseDetail.get('details');
             Map<String, Object> company = (Map<String, Object>)details.get('company');
             Map<String, Object> properties = (Map<String, Object>)company.get('properties');
-            caseDesicion = String.valueOf(properties.get('Go No Go Decision'));
+            caseDecision = String.valueOf(properties.get('Go No Go Decision'));
             
         } else {
             throw new KYCPlatformServiceException('Request failed with status: ' + response.getStatusCode() + ' and body: ' + response.getBody());
         }        
-		
-		return caseDesicion;        
+        
+        return caseDecision;        
     }
     
     public static String createCaseAndSetProperty(String companyName, String countryCode, String entityType, String dataType, String dataValue) {
@@ -123,36 +123,41 @@ public class KYCPlatformService {
     
     @future(callout=true)
     public static void createCasesForOpportunities(List<Id> opportunityIds) {
-            
         List<Opportunity> opptyList = [SELECT Id, 
                                        Name, 
                                        EntityType__c,
                                        InvestmentManager__r.Name, 
-                                       InvestmentManager__r.ShippingCountryCode, 
+                                       InvestmentManager__r.BillingCountryCode, 
                                        BURiskAssessment__c,
                                        KYCCaseID__c,
                                        KYCAssessmentResult__c
                                        FROM Opportunity 
                                        WHERE Id IN :opportunityIds];
-        
+                
         List<Opportunity> opptyUpdateList = new List<Opportunity>();
         for (Opportunity currentOppty : opptyList) {
             
             try {
-                String caseCommonId = createCaseAndSetProperty(currentOppty.InvestmentManager__r.Name, 
-                                                               currentOppty.InvestmentManager__r.ShippingCountryCode, 
-                                                               currentOppty.EntityType__c, 
-                                                               'Overall Risk Rating', 
-                                                               currentOppty.BURiskAssessment__c);
- 				currentOppty.KYCCaseID__c = caseCommonId;
-            	currentOppty.KYCAssessmentResult__c = 'In Progress';     
+                String existingCaseId = checkExistingCasesForCompany(currentOppty.InvestmentManager__r.Name, currentOppty.InvestmentManager__r.BillingCountryCode);
+                if (existingCaseId != 'No Existing Case') {
+                    currentOppty.KYCCaseID__c = existingCaseId;
+                } else {
+                    String caseCommonId = createCaseAndSetProperty(currentOppty.InvestmentManager__r.Name, 
+                                                                   currentOppty.InvestmentManager__r.BillingCountryCode, 
+                                                                   currentOppty.EntityType__c, 
+                                                                   'Overall Risk Rating', 
+                                                                   currentOppty.BURiskAssessment__c);
+                    currentOppty.KYCCaseID__c = caseCommonId;
+                }
+                currentOppty.KYCAssessmentResult__c = 'In Progress';     
                 currentOppty.KYCAssessmentError__c = null;
+                
             } catch (Exception e) {
                 currentOppty.KYCAssessmentResult__c = 'Error';
                 currentOppty.KYCAssessmentError__c = e.getMessage();
             }
-            
-            opptyUpdateList.add(currentOppty);
+                        
+            opptyUpdateList.add(currentOppty);            
             
         }
         
@@ -170,7 +175,7 @@ public class KYCPlatformService {
         
         List<Opportunity> opptyListToUpdate = new List<Opportunity>();
         for (Opportunity opportunity : scope) {
-        	String caseDecision = KYCPlatformService.getCaseDecision(opportunity.KYCCaseID__c);
+            String caseDecision = KYCPlatformService.getCaseDecision(opportunity.KYCCaseID__c);
             
             if (!String.isBlank(caseDecision)) {
                 
@@ -182,9 +187,49 @@ public class KYCPlatformService {
         }
         
         if (!opptyListToUpdate.isEmpty()) {
-        	update opptyListToUpdate;
+            update opptyListToUpdate;
         }
         
+    }
+    
+    public static String checkExistingCasesForCompany(String entityName, String countryCode) {
+        
+        if (String.isBlank(entityName) || String.isBlank(countryCode)) {
+            throw new KYCPlatformServiceException('One or all the parameters passed to method getExistingCasesForCompany are blank');
+        } else if (entityName.contains(' ')) {
+            entityName = entityName.replace(' ', '%20');
+        }
+        
+        KYCPlatformSettings__c kycPlatformSetting = KYCPlatformSettings__c.getInstance(UserInfo.getUserId());
+        
+        HttpRequest request = new HttpRequest();
+        request.setEndpoint(kycPlatformSetting.ApiUrl__c + '/v2/companies/?entityName=' + entityName + '&countryCodeISO31662=' + countryCode);
+        request.setMethod('GET');
+        request.setHeader('Content-Type', 'application/json');
+        request.setHeader('ApiKey', kycPlatformSetting.APIKey__c);
+        
+        String caseCommonId;
+        Http http = new Http();
+        HttpResponse response = http.send(request);
+        if (response.getStatusCode() == 200) {
+            
+            if (response.getBody() == '[]' || String.isBlank(response.getBody())) {
+                caseCommonId = 'No Existing Case';
+            } else {
+                List<Object> caseListDeserialized = (List<Object>) JSON.deserializeUntyped(response.getBody());
+                Object caseObject = caseListDeserialized[0];
+                String caseSerialized = JSON.serialize(caseObject);
+                
+                Map<String, Object> caseAsValuesMap = (Map<String, Object>) JSON.deserializeUntyped(caseSerialized);
+                Map<String, Object> companyInfo = (Map<String, Object>) caseAsValuesMap.get('company');
+                caseCommonId = String.valueOf(companyInfo.get('caseCommonId'));
+            }           
+            
+        } else {
+            throw new KYCPlatformServiceException('Error in HttpRequest with status code: ' + response.getStatusCode());
+        }        
+        
+        return caseCommonId;        
     }
 
 }
